@@ -33,7 +33,7 @@ app.add_middleware(
 
 def get_public_api_base_url():
     render_api_url = os.getenv("RENDER_API_URL", "").strip().rstrip("/")
-    if render_api_url:
+    if render_api_url and "ten-app-cua-ban.onrender.com" not in render_api_url:
         return render_api_url
     return "http://127.0.0.1:8000"
 
@@ -155,10 +155,38 @@ def run_camera():
         return
 
     model = YOLO("yolov8s.pt")
-    cap = cv2.VideoCapture(0)
 
-    if not cap.isOpened():
-        print("[Camera] Cannot open camera index 0.")
+    def open_camera():
+        candidates = [
+            (0, cv2.CAP_DSHOW),
+            (0, cv2.CAP_MSMF),
+            (1, cv2.CAP_DSHOW),
+            (1, cv2.CAP_MSMF),
+            (0, cv2.CAP_ANY),
+            (1, cv2.CAP_ANY),
+            (2, cv2.CAP_ANY),
+        ]
+
+        for index, backend in candidates:
+            cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            ret, _ = cap.read()
+            if ret:
+                print(f"[Camera] Connected with index={index}, backend={backend}")
+                return cap
+
+            cap.release()
+
+        return None
+
+    cap = open_camera()
+    if cap is None:
+        print("[Camera] Cannot open any available camera.")
+        with state_lock:
+            last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return
 
     while True:
