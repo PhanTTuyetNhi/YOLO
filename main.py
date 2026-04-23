@@ -1,19 +1,18 @@
-import cv2
-import numpy as np
-from ultralytics import YOLO
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import threading
-import uvicorn
 from datetime import datetime
-import socket
-import os
 import json
+import os
+import socket
+import threading
 import time
 from urllib import error, request
 
-model = YOLO("yolov8s.pt")
-FLIP_CAMERA = True  # True: lật ngang camera (mirror)
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+
+FLIP_CAMERA = True
+ENABLE_CAMERA = os.getenv("ENABLE_CAMERA", "1") == "1"
 
 people_count = 0
 last_updated = ""
@@ -73,12 +72,14 @@ def sync_state_to_render(count, current_detections):
     except (error.URLError, TimeoutError, OSError) as exc:
         print(f"[Render Sync] Failed to sync to {update_url}: {exc}")
 
+
 @app.get("/")
 def root():
     base_url = get_public_api_base_url()
     return {
         "message": "People counter API is running",
         "api_url": base_url,
+        "camera_enabled": ENABLE_CAMERA,
         "endpoints": {
             "people": f"{base_url}/people",
             "people_detail": f"{base_url}/people/detail",
@@ -86,9 +87,11 @@ def root():
         },
     }
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/people")
 def get_people():
@@ -97,8 +100,9 @@ def get_people():
         return {
             "api_url": base_url,
             "people_count": people_count,
-            "time": last_updated
+            "time": last_updated,
         }
+
 
 @app.get("/people/detail")
 def get_people_detail():
@@ -108,22 +112,21 @@ def get_people_detail():
             "api_url": base_url,
             "people_count": people_count,
             "time": last_updated,
-            "detections": detections
+            "detections": detections,
         }
 
-# ====== BIẾN PHỤ ======
+
 prev_frame = None
 track_history = {}
 
-# ====== MOTION THEO TỪNG NGƯỜI ======
-def has_motion(prev_frame, curr_frame, box, threshold=1500):
-    if prev_frame is None:
+
+def has_motion(cv2, np, previous_frame, current_frame, box, threshold=1500):
+    if previous_frame is None:
         return True
 
     x1, y1, x2, y2 = box
-
-    prev_crop = prev_frame[y1:y2, x1:x2]
-    curr_crop = curr_frame[y1:y2, x1:x2]
+    prev_crop = previous_frame[y1:y2, x1:x2]
+    curr_crop = current_frame[y1:y2, x1:x2]
 
     if prev_crop.shape != curr_crop.shape or prev_crop.size == 0:
         return True
@@ -131,106 +134,98 @@ def has_motion(prev_frame, curr_frame, box, threshold=1500):
     diff = cv2.absdiff(prev_crop, curr_crop)
     gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
-
     return np.sum(thresh) > threshold
 
-# ====== KIỂM TRA GƯƠNG ======
+
 def is_mirror_pair(box1, box2, frame_width, tolerance=80):
     x1 = (box1[0] + box1[2]) // 2
     x2 = (box2[0] + box2[2]) // 2
     return abs((x1 + x2) - frame_width) < tolerance
 
-# ====== CAMERA ======
+
 def run_camera():
     global people_count, last_updated, prev_frame, track_history, detections
 
+    try:
+        import cv2
+        import numpy as np
+        from ultralytics import YOLO
+    except ImportError as exc:
+        print(f"[Camera] Camera mode disabled because dependencies are missing: {exc}")
+        return
+
+    model = YOLO("yolov8s.pt")
     cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("[Camera] Cannot open camera index 0.")
+        return
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("[Camera] Failed to read frame.")
             break
+
         if FLIP_CAMERA:
             frame = cv2.flip(frame, 1)
 
-        h, w, _ = frame.shape
-
-        # ===== TRACKING =====
-        results = model.track(
-            frame,
-            persist=True,
-            conf=0.5,
-            iou=0.5
-        )
-
+        _, w, _ = frame.shape
+        results = model.track(frame, persist=True, conf=0.5, iou=0.5)
         current_boxes = []
 
-        for r in results:
-            for box in r.boxes:
+        for result in results:
+            for box in result.boxes:
                 cls = int(box.cls[0])
+                if cls != 0 or box.conf[0] <= 0.5 or box.id is None:
+                    continue
 
-                # ===== LỌC NGƯỜI + CONF =====
-                if cls == 0 and box.conf[0] > 0.5 and box.id is not None:
-                    track_id = int(box.id[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                track_id = int(box.id[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                    # ===== ROI: LOẠI VÙNG GƯƠNG (GIẢ SỬ BÊN PHẢI) =====
-                    if x1 > w * 0.85:
-                        continue
+                if x1 > w * 0.85:
+                    continue
 
-                    # ===== MOTION FILTER =====
-                    if not has_motion(prev_frame, frame, (x1, y1, x2, y2)):
-                        continue
+                if not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
+                    continue
 
-                    # ===== TRACK HISTORY =====
-                    center = ((x1+x2)//2, (y1+y2)//2)
+                center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                track_history.setdefault(track_id, []).append(center)
+                if len(track_history[track_id]) > 10:
+                    track_history[track_id].pop(0)
+                if len(track_history[track_id]) < 5:
+                    continue
 
-                    if track_id not in track_history:
-                        track_history[track_id] = []
+                current_boxes.append((track_id, x1, y1, x2, y2))
 
-                    track_history[track_id].append(center)
-
-                    if len(track_history[track_id]) > 10:
-                        track_history[track_id].pop(0)
-
-                    # ===== LOẠI OBJECT MỚI XUẤT HIỆN (GIẢM NHIỄU) =====
-                    if len(track_history[track_id]) < 5:
-                        continue
-
-                    current_boxes.append((track_id, x1, y1, x2, y2))
-
-        # ===== MIRROR FILTER =====
         removed_ids = set()
-
         for i in range(len(current_boxes)):
-            for j in range(i+1, len(current_boxes)):
-                id1, x1a, y1a, x2a, y2a = current_boxes[i]
+            for j in range(i + 1, len(current_boxes)):
+                _, x1a, y1a, x2a, y2a = current_boxes[i]
                 id2, x1b, y1b, x2b, y2b = current_boxes[j]
-
-                if is_mirror_pair(
-                    (x1a, y1a, x2a, y2a),
-                    (x1b, y1b, x2b, y2b),
-                    w
-                ):
+                if is_mirror_pair((x1a, y1a, x2a, y2a), (x1b, y1b, x2b, y2b), w):
                     removed_ids.add(id2)
 
-        # ===== ĐẾM =====
         count = 0
         current_detections = []
 
-        for (track_id, x1, y1, x2, y2) in current_boxes:
+        for track_id, x1, y1, x2, y2 in current_boxes:
             if track_id in removed_ids:
                 continue
 
             count += 1
-            current_detections.append({
-                "id": track_id,
-                "bbox": [x1, y1, x2, y2]
-            })
+            current_detections.append({"id": track_id, "bbox": [x1, y1, x2, y2]})
 
-            cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
-            cv2.putText(frame, f"ID {track_id}", (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"ID {track_id}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 0, 0),
+                2,
+            )
 
         with state_lock:
             people_count = count
@@ -239,13 +234,18 @@ def run_camera():
 
         sync_state_to_render(count, current_detections)
 
-        cv2.putText(frame, f"People: {count}", (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-
+        cv2.putText(
+            frame,
+            f"People: {count}",
+            (20, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
+            2,
+        )
         cv2.imshow("Camera", frame)
 
         prev_frame = frame.copy()
-
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
@@ -263,10 +263,13 @@ def get_local_ip():
     finally:
         sock.close()
 
-# ====== MAIN ======
+
 if __name__ == "__main__":
-    t = threading.Thread(target=run_camera)
-    t.start()
+    if ENABLE_CAMERA:
+        t = threading.Thread(target=run_camera, daemon=True)
+        t.start()
+    else:
+        print("[Camera] ENABLE_CAMERA=0, starting API without camera thread.")
 
     local_ip = get_local_ip()
     public_api_url = get_public_api_base_url()
@@ -274,4 +277,5 @@ if __name__ == "__main__":
     print(f"API local: http://127.0.0.1:8000/people")
     print(f"API LAN:   http://{local_ip}:8000/people")
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
