@@ -13,6 +13,7 @@ import uvicorn
 
 FLIP_CAMERA = True
 ENABLE_CAMERA = os.getenv("ENABLE_CAMERA", "1") == "1"
+MIN_TRACK_HISTORY = int(os.getenv("MIN_TRACK_HISTORY", "2"))
 
 people_count = 0
 last_updated = ""
@@ -199,32 +200,50 @@ def run_camera():
             frame = cv2.flip(frame, 1)
 
         _, w, _ = frame.shape
-        results = model.track(frame, persist=True, conf=0.5, iou=0.5)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        results = model.track(frame, persist=True, conf=0.4, iou=0.5, verbose=False)
         current_boxes = []
 
         for result in results:
             for box in result.boxes:
                 cls = int(box.cls[0])
-                if cls != 0 or box.conf[0] <= 0.5 or box.id is None:
+                if cls != 0 or box.conf[0] <= 0.4:
                     continue
 
-                track_id = int(box.id[0])
+                track_id = int(box.id[0]) if box.id is not None else -1
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
                 if x1 > w * 0.85:
                     continue
 
-                if not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
+                if box.id is not None and not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
                     continue
 
-                center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                track_history.setdefault(track_id, []).append(center)
-                if len(track_history[track_id]) > 10:
-                    track_history[track_id].pop(0)
-                if len(track_history[track_id]) < 5:
-                    continue
+                if box.id is not None:
+                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    track_history.setdefault(track_id, []).append(center)
+                    if len(track_history[track_id]) > 10:
+                        track_history[track_id].pop(0)
+                    if len(track_history[track_id]) < MIN_TRACK_HISTORY:
+                        continue
 
                 current_boxes.append((track_id, x1, y1, x2, y2))
+
+        if not current_boxes:
+            detect_results = model(frame, conf=0.4, verbose=False)
+            fallback_id = 1
+            for result in detect_results:
+                for box in result.boxes:
+                    cls = int(box.cls[0])
+                    if cls != 0 or box.conf[0] <= 0.4:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    if x1 > w * 0.85:
+                        continue
+
+                    current_boxes.append((fallback_id, x1, y1, x2, y2))
+                    fallback_id += 1
 
         removed_ids = set()
         for i in range(len(current_boxes)):
@@ -258,7 +277,7 @@ def run_camera():
         with state_lock:
             people_count = count
             detections = current_detections
-            last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            last_updated = current_time
 
         sync_state_to_render(count, current_detections)
 
