@@ -112,12 +112,8 @@ def health():
 def get_people():
     with state_lock:
         return {
-            "api_url": get_public_api_base_url(),
             "people_count": people_count,
             "time": get_response_time(),
-            "last_updated": last_updated,
-            "last_received_at": last_received_at,
-            "source": last_source,
         }
 
 

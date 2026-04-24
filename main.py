@@ -7,11 +7,6 @@ import time
 from urllib import error, request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-import uvicorn
-
 from settings import load_env_file
 
 
@@ -40,6 +35,7 @@ CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
 CAMERA_FPS = int(os.getenv("CAMERA_FPS", "30"))
 CAMERA_BUFFER_SIZE = max(1, int(os.getenv("CAMERA_BUFFER_SIZE", "1")))
 IDLE_SLEEP_SECONDS = float(os.getenv("IDLE_SLEEP_SECONDS", "0.005"))
+TRACKER_CONFIG = os.getenv("YOLO_TRACKER_CONFIG", "tracker.yaml")
 
 people_count = 0
 last_updated = ""
@@ -48,35 +44,12 @@ state_lock = threading.Lock()
 last_sync_at = 0.0
 last_sync_ok = False
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware("http")
-async def disable_cache(request, call_next):
-    response: Response = await call_next(request)
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    return response
-
 
 def get_public_api_base_url():
     render_api_url = os.getenv("RENDER_API_URL", "").strip().rstrip("/")
     if render_api_url and "ten-app-cua-ban.onrender.com" not in render_api_url:
         return render_api_url
-    return "http://127.0.0.1:8000"
-
-
-def get_response_time():
-    return datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+    return ""
 
 
 def wake_render_service(render_api_url, timeout):
@@ -142,52 +115,6 @@ def sync_state_to_render(count, current_detections):
         last_sync_ok = False
         print(f"[Render Sync] Failed to sync to {update_url}: {exc}")
 
-
-@app.get("/")
-def root():
-    base_url = get_public_api_base_url()
-    return {
-        "message": "People counter API is running",
-        "api_url": base_url,
-        "camera_enabled": ENABLE_CAMERA,
-        "endpoints": {
-            "people": f"{base_url}/people",
-            "people_detail": f"{base_url}/people/detail",
-            "health": f"{base_url}/health",
-        },
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "time": get_response_time()}
-
-
-@app.get("/people")
-def get_people():
-    base_url = get_public_api_base_url()
-    with state_lock:
-        return {
-            "api_url": base_url,
-            "people_count": people_count,
-            "time": get_response_time(),
-            "last_updated": last_updated,
-        }
-
-
-@app.get("/people/detail")
-def get_people_detail():
-    base_url = get_public_api_base_url()
-    with state_lock:
-        return {
-            "api_url": base_url,
-            "people_count": people_count,
-            "time": get_response_time(),
-            "last_updated": last_updated,
-            "detections": detections,
-        }
-
-
 prev_frame = None
 track_history = {}
 
@@ -229,7 +156,7 @@ def run_camera():
     model = YOLO(MODEL_PATH)
     print(
         f"[Camera] Using model={MODEL_PATH}, imgsz={INFER_IMG_SIZE}, "
-        f"process_every_n_frames={PROCESS_EVERY_N_FRAMES}"
+        f"process_every_n_frames={PROCESS_EVERY_N_FRAMES}, tracker={TRACKER_CONFIG}"
     )
 
     def open_camera():
@@ -323,6 +250,7 @@ def run_camera():
                 conf=0.4,
                 iou=0.5,
                 imgsz=INFER_IMG_SIZE,
+                tracker=TRACKER_CONFIG,
                 verbose=False,
             )
             current_boxes = []
@@ -442,19 +370,14 @@ def get_local_ip():
 
 
 if __name__ == "__main__":
-    if ENABLE_CAMERA:
-        t = threading.Thread(target=run_camera, daemon=True)
-        t.start()
-    else:
-        print("[Camera] ENABLE_CAMERA=0, starting API without camera thread.")
-
-    local_ip = get_local_ip()
     public_api_url = get_public_api_base_url()
-    if not os.getenv("RENDER_API_URL", "").strip():
+    if public_api_url:
+        print(f"[Render Sync] Target API: {public_api_url}/update")
+    else:
         print("[Render Sync] RENDER_API_URL is empty. State will not sync to Render.")
-    print(f"API public: {public_api_url}/people")
-    print(f"API local: http://127.0.0.1:8000/people")
-    print(f"API LAN:   http://{local_ip}:8000/people")
 
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    if not ENABLE_CAMERA:
+        print("[Camera] ENABLE_CAMERA=0, nothing to run.")
+    else:
+        print(f"[Camera] Local IP: {get_local_ip()}")
+        run_camera()
