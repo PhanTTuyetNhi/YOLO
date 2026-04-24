@@ -6,5 +6,6 @@ __pycache__/
 *.pyd
 .env
 .env.*
+!.env.example
 yolov8n.pt
 yolov8s.pt

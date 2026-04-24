@@ -1,25 +1,52 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import socket
 import threading
 import time
 from urllib import error, request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 import uvicorn
 
+from settings import load_env_file
+
+
+load_env_file()
+
+
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Bangkok").strip() or "Asia/Bangkok"
+DEFAULT_TIMEZONE = timezone(timedelta(hours=7), name="Asia/Bangkok")
+
+
+def get_app_timezone():
+    try:
+        return ZoneInfo(APP_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        return DEFAULT_TIMEZONE
 
 FLIP_CAMERA = True
 ENABLE_CAMERA = os.getenv("ENABLE_CAMERA", "1") == "1"
 MIN_TRACK_HISTORY = int(os.getenv("MIN_TRACK_HISTORY", "2"))
+MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8s.pt")
+INFER_IMG_SIZE = int(os.getenv("INFER_IMG_SIZE", "416"))
+PROCESS_EVERY_N_FRAMES = max(1, int(os.getenv("PROCESS_EVERY_N_FRAMES", "1")))
+FALLBACK_DETECT_INTERVAL = max(1, int(os.getenv("FALLBACK_DETECT_INTERVAL", "6")))
+CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
+CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
+CAMERA_FPS = int(os.getenv("CAMERA_FPS", "30"))
+CAMERA_BUFFER_SIZE = max(1, int(os.getenv("CAMERA_BUFFER_SIZE", "1")))
+IDLE_SLEEP_SECONDS = float(os.getenv("IDLE_SLEEP_SECONDS", "0.005"))
 
 people_count = 0
 last_updated = ""
 detections = []
 state_lock = threading.Lock()
 last_sync_at = 0.0
+last_sync_ok = False
 
 app = FastAPI()
 
@@ -32,6 +59,15 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def disable_cache(request, call_next):
+    response: Response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 def get_public_api_base_url():
     render_api_url = os.getenv("RENDER_API_URL", "").strip().rstrip("/")
     if render_api_url and "ten-app-cua-ban.onrender.com" not in render_api_url:
@@ -39,8 +75,22 @@ def get_public_api_base_url():
     return "http://127.0.0.1:8000"
 
 
+def get_response_time():
+    return datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def wake_render_service(render_api_url, timeout):
+    health_url = f"{render_api_url}/health"
+    try:
+        with request.urlopen(health_url, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except (error.URLError, TimeoutError, OSError) as exc:
+        print(f"[Render Sync] Wake-up failed for {health_url}: {exc}")
+        return False
+
+
 def sync_state_to_render(count, current_detections):
-    global last_sync_at
+    global last_sync_at, last_sync_ok
 
     render_api_url = os.getenv("RENDER_API_URL", "").strip().rstrip("/")
     if not render_api_url:
@@ -54,6 +104,8 @@ def sync_state_to_render(count, current_detections):
     payload = json.dumps(
         {
             "people_count": int(count),
+            "time": datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S"),
+            "source": socket.gethostname(),
             "detections": current_detections,
         }
     ).encode("utf-8")
@@ -65,12 +117,29 @@ def sync_state_to_render(count, current_detections):
 
     update_url = f"{render_api_url}/update"
     req = request.Request(update_url, data=payload, headers=headers, method="POST")
+    sync_timeout = float(os.getenv("RENDER_SYNC_TIMEOUT", "20"))
+    wake_timeout = float(os.getenv("RENDER_WAKE_TIMEOUT", "70"))
+    wake_after = float(os.getenv("RENDER_WAKE_AFTER", "600"))
 
     try:
-        with request.urlopen(req, timeout=3) as response:
+        if not last_sync_ok or (now - last_sync_at) >= wake_after:
+            wake_render_service(render_api_url, timeout=wake_timeout)
+
+        with request.urlopen(req, timeout=sync_timeout) as response:
             if 200 <= response.status < 300:
                 last_sync_at = now
+                if not last_sync_ok:
+                    print(f"[Render Sync] Sync resumed successfully to {update_url}")
+                last_sync_ok = True
+    except error.HTTPError as exc:
+        last_sync_ok = False
+        try:
+            details = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = exc.reason
+        print(f"[Render Sync] HTTP {exc.code} when syncing to {update_url}: {details}")
     except (error.URLError, TimeoutError, OSError) as exc:
+        last_sync_ok = False
         print(f"[Render Sync] Failed to sync to {update_url}: {exc}")
 
 
@@ -91,7 +160,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "time": get_response_time()}
 
 
 @app.get("/people")
@@ -101,7 +170,8 @@ def get_people():
         return {
             "api_url": base_url,
             "people_count": people_count,
-            "time": last_updated,
+            "time": get_response_time(),
+            "last_updated": last_updated,
         }
 
 
@@ -112,7 +182,8 @@ def get_people_detail():
         return {
             "api_url": base_url,
             "people_count": people_count,
-            "time": last_updated,
+            "time": get_response_time(),
+            "last_updated": last_updated,
             "detections": detections,
         }
 
@@ -155,7 +226,11 @@ def run_camera():
         print(f"[Camera] Camera mode disabled because dependencies are missing: {exc}")
         return
 
-    model = YOLO("yolov8s.pt")
+    model = YOLO(MODEL_PATH)
+    print(
+        f"[Camera] Using model={MODEL_PATH}, imgsz={INFER_IMG_SIZE}, "
+        f"process_every_n_frames={PROCESS_EVERY_N_FRAMES}"
+    )
 
     def open_camera():
         candidates = [
@@ -174,6 +249,11 @@ def run_camera():
                 cap.release()
                 continue
 
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+
             ret, _ = cap.read()
             if ret:
                 print(f"[Camera] Connected with index={index}, backend={backend}")
@@ -187,82 +267,131 @@ def run_camera():
     if cap is None:
         print("[Camera] Cannot open any available camera.")
         with state_lock:
-            last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            last_updated = datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S")
         return
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[Camera] Failed to read frame.")
-            break
+    latest_frame = None
+    latest_frame_lock = threading.Lock()
+    latest_frame_index = 0
+    capture_running = True
 
-        if FLIP_CAMERA:
-            frame = cv2.flip(frame, 1)
+    def capture_frames():
+        nonlocal latest_frame, latest_frame_index, capture_running
+
+        while capture_running:
+            ok, captured_frame = cap.read()
+            if not ok:
+                print("[Camera] Failed to read frame.")
+                capture_running = False
+                break
+
+            if FLIP_CAMERA:
+                captured_frame = cv2.flip(captured_frame, 1)
+
+            with latest_frame_lock:
+                latest_frame = captured_frame
+                latest_frame_index += 1
+
+    capture_thread = threading.Thread(target=capture_frames, daemon=True)
+    capture_thread.start()
+
+    processed_frame_index = 0
+    latest_count = 0
+    latest_detections = []
+    latest_boxes_for_draw = []
+    latest_processed_time = ""
+
+    while capture_running:
+        with latest_frame_lock:
+            frame = None if latest_frame is None else latest_frame.copy()
+            frame_index = latest_frame_index
+
+        if frame is None or frame_index == processed_frame_index:
+            time.sleep(IDLE_SLEEP_SECONDS)
+            continue
+
+        processed_frame_index = frame_index
 
         _, w, _ = frame.shape
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        results = model.track(frame, persist=True, conf=0.4, iou=0.5, verbose=False)
-        current_boxes = []
+        current_time = datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+        should_process = frame_index % PROCESS_EVERY_N_FRAMES == 0
 
-        for result in results:
-            for box in result.boxes:
-                cls = int(box.cls[0])
-                if cls != 0 or box.conf[0] <= 0.4:
-                    continue
+        if should_process:
+            results = model.track(
+                frame,
+                persist=True,
+                conf=0.4,
+                iou=0.5,
+                imgsz=INFER_IMG_SIZE,
+                verbose=False,
+            )
+            current_boxes = []
 
-                track_id = int(box.id[0]) if box.id is not None else -1
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-                if x1 > w * 0.85:
-                    continue
-
-                if box.id is not None and not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
-                    continue
-
-                if box.id is not None:
-                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                    track_history.setdefault(track_id, []).append(center)
-                    if len(track_history[track_id]) > 10:
-                        track_history[track_id].pop(0)
-                    if len(track_history[track_id]) < MIN_TRACK_HISTORY:
-                        continue
-
-                current_boxes.append((track_id, x1, y1, x2, y2))
-
-        if not current_boxes:
-            detect_results = model(frame, conf=0.4, verbose=False)
-            fallback_id = 1
-            for result in detect_results:
+            for result in results:
                 for box in result.boxes:
                     cls = int(box.cls[0])
                     if cls != 0 or box.conf[0] <= 0.4:
                         continue
 
+                    track_id = int(box.id[0]) if box.id is not None else -1
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
+
                     if x1 > w * 0.85:
                         continue
 
-                    current_boxes.append((fallback_id, x1, y1, x2, y2))
-                    fallback_id += 1
+                    if box.id is not None and not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
+                        continue
 
-        removed_ids = set()
-        for i in range(len(current_boxes)):
-            for j in range(i + 1, len(current_boxes)):
-                _, x1a, y1a, x2a, y2a = current_boxes[i]
-                id2, x1b, y1b, x2b, y2b = current_boxes[j]
-                if is_mirror_pair((x1a, y1a, x2a, y2a), (x1b, y1b, x2b, y2b), w):
-                    removed_ids.add(id2)
+                    if box.id is not None:
+                        center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                        track_history.setdefault(track_id, []).append(center)
+                        if len(track_history[track_id]) > 10:
+                            track_history[track_id].pop(0)
+                        if len(track_history[track_id]) < MIN_TRACK_HISTORY:
+                            continue
 
-        count = 0
-        current_detections = []
+                    current_boxes.append((track_id, x1, y1, x2, y2))
 
-        for track_id, x1, y1, x2, y2 in current_boxes:
-            if track_id in removed_ids:
-                continue
+            if not current_boxes and frame_index % FALLBACK_DETECT_INTERVAL == 0:
+                detect_results = model(frame, conf=0.4, imgsz=INFER_IMG_SIZE, verbose=False)
+                fallback_id = 1
+                for result in detect_results:
+                    for box in result.boxes:
+                        cls = int(box.cls[0])
+                        if cls != 0 or box.conf[0] <= 0.4:
+                            continue
 
-            count += 1
-            current_detections.append({"id": track_id, "bbox": [x1, y1, x2, y2]})
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        if x1 > w * 0.85:
+                            continue
 
+                        current_boxes.append((fallback_id, x1, y1, x2, y2))
+                        fallback_id += 1
+
+            removed_ids = set()
+            for i in range(len(current_boxes)):
+                for j in range(i + 1, len(current_boxes)):
+                    _, x1a, y1a, x2a, y2a = current_boxes[i]
+                    id2, x1b, y1b, x2b, y2b = current_boxes[j]
+                    if is_mirror_pair((x1a, y1a, x2a, y2a), (x1b, y1b, x2b, y2b), w):
+                        removed_ids.add(id2)
+
+            latest_count = 0
+            latest_detections = []
+            latest_boxes_for_draw = []
+            latest_processed_time = current_time
+
+            for track_id, x1, y1, x2, y2 in current_boxes:
+                if track_id in removed_ids:
+                    continue
+
+                latest_count += 1
+                latest_detections.append({"id": track_id, "bbox": [x1, y1, x2, y2]})
+                latest_boxes_for_draw.append((track_id, x1, y1, x2, y2))
+
+            prev_frame = frame.copy()
+
+        for track_id, x1, y1, x2, y2 in latest_boxes_for_draw:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
                 frame,
@@ -275,15 +404,15 @@ def run_camera():
             )
 
         with state_lock:
-            people_count = count
-            detections = current_detections
-            last_updated = current_time
+            people_count = latest_count
+            detections = latest_detections
+            last_updated = latest_processed_time or current_time
 
-        sync_state_to_render(count, current_detections)
+        sync_state_to_render(latest_count, latest_detections)
 
         cv2.putText(
             frame,
-            f"People: {count}",
+            f"People: {latest_count}",
             (20, 50),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
@@ -292,10 +421,11 @@ def run_camera():
         )
         cv2.imshow("Camera", frame)
 
-        prev_frame = frame.copy()
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
+    capture_running = False
+    capture_thread.join(timeout=1)
     cap.release()
     cv2.destroyAllWindows()
 
@@ -320,6 +450,8 @@ if __name__ == "__main__":
 
     local_ip = get_local_ip()
     public_api_url = get_public_api_base_url()
+    if not os.getenv("RENDER_API_URL", "").strip():
+        print("[Render Sync] RENDER_API_URL is empty. State will not sync to Render.")
     print(f"API public: {public_api_url}/people")
     print(f"API local: http://127.0.0.1:8000/people")
     print(f"API LAN:   http://{local_ip}:8000/people")
